@@ -31,6 +31,34 @@ import {
 const CANVAS_SIZE = 1000;
 const OCR_MIN_DIGITS = 6;
 const DECODE_MAX = 2800;
+const VARIANT_MAX = 1600;
+const UPSCALE_MIN = 1000;
+const DECODE_BUDGET_MS = 12_000;
+const WASM_LINEAR_FORMATS = [
+  'Code128',
+  'Code39',
+  'EAN13',
+  'EAN8',
+  'UPCA',
+  'ITF',
+  'Codabar',
+] as const;
+
+type DecodeHit = { text: string; format: string };
+type EngineMode = 'both' | 'js';
+type DecodeProgress = (hint: string) => void;
+type WasmReadBarcodes = (typeof import('zxing-wasm/reader'))['readBarcodes'];
+
+const WASM_READER_OPTIONS = {
+  tryHarder: true,
+  tryRotate: true,
+  tryInvert: true,
+  tryDownscale: true,
+  formats: [...WASM_LINEAR_FORMATS],
+  maxNumberOfSymbols: 1,
+};
+
+let wasmReadPromise: Promise<WasmReadBarcodes | null> | null = null;
 
 function isPhoneDevice() {
   if (typeof navigator === 'undefined') return false;
@@ -83,6 +111,19 @@ function sourceSize(source: HTMLImageElement | HTMLCanvasElement) {
   return { width: source.width, height: source.height };
 }
 
+function fillWhite(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+) {
+  ctx.save();
+  ctx.filter = 'none';
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, width, height);
+  ctx.restore();
+}
+
 function imageToCanvas(
   source: HTMLImageElement | HTMLCanvasElement,
   max = DECODE_MAX,
@@ -96,6 +137,7 @@ function imageToCanvas(
   if (!ctx) return canvas;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
+  fillWhite(ctx, canvas.width, canvas.height);
   ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
   return canvas;
 }
@@ -103,19 +145,285 @@ function imageToCanvas(
 function contrastCanvas(
   source: HTMLImageElement | HTMLCanvasElement,
   contrast: number,
+  max = DECODE_MAX,
 ): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   const { width, height } = sourceSize(source);
-  const scale = Math.min(1, DECODE_MAX / Math.max(width, height));
+  const scale = Math.min(1, max / Math.max(width, height));
   canvas.width = Math.max(1, Math.round(width * scale));
   canvas.height = Math.max(1, Math.round(height * scale));
   const ctx = canvas.getContext('2d');
   if (!ctx) return canvas;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
+  fillWhite(ctx, canvas.width, canvas.height);
   ctx.filter = `grayscale(1) contrast(${contrast})`;
   ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
   return canvas;
+}
+
+function clampByte(value: number) {
+  return Math.max(0, Math.min(255, value));
+}
+
+function otsuThreshold(hist: Uint32Array, total: number) {
+  let sum = 0;
+  for (let t = 0; t < 256; t++) sum += t * hist[t];
+  let sumB = 0;
+  let wB = 0;
+  let maxVar = 0;
+  let threshold = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const variance = wB * wF * (mB - mF) ** 2;
+    if (variance > maxVar) {
+      maxVar = variance;
+      threshold = t;
+    }
+  }
+  return threshold;
+}
+
+function thresholdCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  max = VARIANT_MAX,
+): HTMLCanvasElement {
+  const canvas = imageToCanvas(source, max);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = image.data;
+  const hist = new Uint32Array(256);
+  const gray = new Uint8Array(canvas.width * canvas.height);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const value = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    gray[p] = value;
+    hist[value] += 1;
+  }
+  const threshold = otsuThreshold(hist, gray.length);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const value = gray[p] > threshold ? 255 : 0;
+    data[i] = value;
+    data[i + 1] = value;
+    data[i + 2] = value;
+  }
+  ctx.putImageData(image, 0, 0);
+  return canvas;
+}
+
+function invertCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  max = VARIANT_MAX,
+): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  const { width, height } = sourceSize(source);
+  const scale = Math.min(1, max / Math.max(width, height));
+  canvas.width = Math.max(1, Math.round(width * scale));
+  canvas.height = Math.max(1, Math.round(height * scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  fillWhite(ctx, canvas.width, canvas.height);
+  ctx.filter = 'invert(1) grayscale(1) contrast(1.4)';
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function sharpenCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  max = VARIANT_MAX,
+): HTMLCanvasElement {
+  const canvas = imageToCanvas(source, max);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  const blur = document.createElement('canvas');
+  blur.width = canvas.width;
+  blur.height = canvas.height;
+  const blurCtx = blur.getContext('2d');
+  if (!blurCtx) return canvas;
+  blurCtx.filter = 'blur(1.4px)';
+  blurCtx.drawImage(canvas, 0, 0);
+  const sharp = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const blurred = blurCtx.getImageData(0, 0, canvas.width, canvas.height);
+  const amount = 1.6;
+  for (let i = 0; i < sharp.data.length; i += 4) {
+    sharp.data[i] = clampByte(sharp.data[i] + (sharp.data[i] - blurred.data[i]) * amount);
+    sharp.data[i + 1] = clampByte(
+      sharp.data[i + 1] + (sharp.data[i + 1] - blurred.data[i + 1]) * amount,
+    );
+    sharp.data[i + 2] = clampByte(
+      sharp.data[i + 2] + (sharp.data[i + 2] - blurred.data[i + 2]) * amount,
+    );
+  }
+  ctx.putImageData(sharp, 0, 0);
+  return canvas;
+}
+
+function rotateCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  degrees: number,
+  max = VARIANT_MAX,
+): HTMLCanvasElement {
+  const base = imageToCanvas(source, max);
+  const radians = (degrees * Math.PI) / 180;
+  const cos = Math.abs(Math.cos(radians));
+  const sin = Math.abs(Math.sin(radians));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(base.width * cos + base.height * sin));
+  canvas.height = Math.max(1, Math.round(base.width * sin + base.height * cos));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(radians);
+  ctx.drawImage(base, -base.width / 2, -base.height / 2);
+  return canvas;
+}
+
+function cropCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  leftRatio: number,
+  topRatio: number,
+  widthRatio: number,
+  heightRatio: number,
+  max = VARIANT_MAX,
+): HTMLCanvasElement {
+  const { width, height } = sourceSize(source);
+  const sx = Math.round(width * leftRatio);
+  const sy = Math.round(height * topRatio);
+  const sw = Math.max(1, Math.round(width * widthRatio));
+  const sh = Math.max(1, Math.round(height * heightRatio));
+  const canvas = document.createElement('canvas');
+  const scale = Math.min(1, max / Math.max(sw, sh));
+  canvas.width = Math.max(1, Math.round(sw * scale));
+  canvas.height = Math.max(1, Math.round(sh * scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  fillWhite(ctx, canvas.width, canvas.height);
+  ctx.drawImage(source, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function upscaleCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  factor = 2,
+  max = VARIANT_MAX,
+): HTMLCanvasElement {
+  const { width, height } = sourceSize(source);
+  const canvas = document.createElement('canvas');
+  const targetW = width * factor;
+  const targetH = height * factor;
+  const scale = Math.min(1, max / Math.max(targetW, targetH));
+  canvas.width = Math.max(1, Math.round(targetW * scale));
+  canvas.height = Math.max(1, Math.round(targetH * scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  fillWhite(ctx, canvas.width, canvas.height);
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function yieldToUi() {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 0);
+  });
+}
+
+function getWasmRead() {
+  if (!wasmReadPromise) {
+    wasmReadPromise = (async () => {
+      try {
+        const [mod, wasmMod] = await Promise.all([
+          import('zxing-wasm/reader'),
+          import('zxing-wasm/reader/zxing_reader.wasm?url'),
+        ]);
+        const wasmUrl = wasmMod.default;
+        mod.prepareZXingModule({
+          overrides: {
+            locateFile: (path: string, prefix: string) =>
+              path.endsWith('.wasm') ? wasmUrl : `${prefix}${path}`,
+          },
+        });
+        return mod.readBarcodes;
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return wasmReadPromise;
+}
+
+function mapWasmFormat(format: string): string {
+  const key = format.replace(/[\s_-]/g, '').toLowerCase();
+  if (key.includes('code39') || key === 'code32' || key === 'pzn') return 'CODE39';
+  if (key.includes('code128')) return 'CODE128';
+  if (key.includes('ean8')) return 'EAN8';
+  if (key.includes('ean13') || key === 'isbn') return 'EAN13';
+  if (key.includes('upc')) return 'UPC';
+  if (key.includes('itf')) return 'ITF';
+  if (key.includes('codabar')) return 'codabar';
+  return 'CODE128';
+}
+
+function pickWasmHit(results: Awaited<ReturnType<WasmReadBarcodes>>): DecodeHit | null {
+  const match = results.find((result) => result.isValid && result.text.trim());
+  if (!match) return null;
+  return { text: match.text.trim(), format: mapWasmFormat(match.format) };
+}
+
+async function tryWasmInput(
+  readWasm: WasmReadBarcodes | null,
+  input: Blob | ImageData,
+): Promise<DecodeHit | null> {
+  if (!readWasm) return null;
+  try {
+    return pickWasmHit(await readWasm(input, WASM_READER_OPTIONS));
+  } catch {
+    return null;
+  }
+}
+
+function canvasImageData(canvas: HTMLCanvasElement): ImageData | null {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  try {
+    return ctx.getImageData(0, 0, canvas.width, canvas.height);
+  } catch {
+    return null;
+  }
+}
+
+async function tryDecodeCanvas(
+  canvas: HTMLCanvasElement,
+  reader: BrowserMultiFormatReader,
+  readWasm: WasmReadBarcodes | null,
+  engines: EngineMode,
+): Promise<DecodeHit | null> {
+  if (engines !== 'js') {
+    const imageData = canvasImageData(canvas);
+    if (imageData) {
+      const hit = await tryWasmInput(readWasm, imageData);
+      if (hit) return hit;
+    }
+  }
+  try {
+    const result = reader.decodeFromCanvas(canvas);
+    return { text: result.getText(), format: mapZxingFormat(result.getBarcodeFormat()) };
+  } catch {
+    return null;
+  }
 }
 
 function extractDigits(text: string): string {
@@ -145,28 +453,73 @@ function pickBestDigits(samples: string[]): string {
   return best;
 }
 
-async function decodeBarcode(url: string) {
+async function decodeBarcode(url: string, onProgress?: DecodeProgress): Promise<DecodeHit> {
+  const deadline = Date.now() + DECODE_BUDGET_MS;
   const reader = createReader();
+  const readWasm = await getWasmRead();
+
   try {
-    return await reader.decodeFromImageUrl(url);
+    const result = await reader.decodeFromImageUrl(url);
+    return { text: result.getText(), format: mapZxingFormat(result.getBarcodeFormat()) };
   } catch {
     // Photo tickets are often low-contrast; try processed canvases.
   }
-  const img = await loadImage(url);
-  const variants = [
-    imageToCanvas(img),
-    contrastCanvas(img, 1.4),
-    contrastCanvas(img, 2),
-    contrastCanvas(img, 2.8),
-    contrastCanvas(img, 3.6),
-  ];
-  for (const canvas of variants) {
-    try {
-      return reader.decodeFromCanvas(canvas);
-    } catch {
-      // try next
-    }
+
+  let img: HTMLImageElement;
+  try {
+    img = await loadImage(url);
+  } catch {
+    throw new Error('not found');
   }
+
+  // Flatten onto white first — transparent PNG bars look solid-black to WASM.
+  const full = imageToCanvas(img, DECODE_MAX);
+  const fullHit = await tryDecodeCanvas(full, reader, readWasm, 'both');
+  if (fullHit) return fullHit;
+
+  onProgress?.('Still trying — enhancing the photo...');
+
+  const stage2: Array<() => HTMLCanvasElement> = [
+    () => contrastCanvas(img, 1.4, VARIANT_MAX),
+    () => contrastCanvas(img, 2, VARIANT_MAX),
+    () => contrastCanvas(img, 2.8, VARIANT_MAX),
+    () => contrastCanvas(img, 3.6, VARIANT_MAX),
+    () => thresholdCanvas(img),
+    () => invertCanvas(img),
+    () => sharpenCanvas(img),
+  ];
+
+  for (const make of stage2) {
+    if (Date.now() > deadline) break;
+    await yieldToUi();
+    const hit = await tryDecodeCanvas(make(), reader, readWasm, 'both');
+    if (hit) return hit;
+  }
+
+  const stage3: Array<{ make: () => HTMLCanvasElement; engines: EngineMode }> = [
+    { make: () => rotateCanvas(img, 90), engines: 'js' },
+    { make: () => rotateCanvas(img, 180), engines: 'js' },
+    { make: () => rotateCanvas(img, 270), engines: 'js' },
+    { make: () => rotateCanvas(img, 10), engines: 'both' },
+    { make: () => rotateCanvas(img, -10), engines: 'both' },
+    { make: () => rotateCanvas(img, 20), engines: 'both' },
+    { make: () => rotateCanvas(img, -20), engines: 'both' },
+    { make: () => cropCanvas(img, 0, 0.25, 1, 0.5), engines: 'both' },
+    { make: () => cropCanvas(img, 0.15, 0.15, 0.7, 0.7), engines: 'both' },
+  ];
+
+  const { width, height } = sourceSize(img);
+  if (Math.max(width, height) < UPSCALE_MIN) {
+    stage3.push({ make: () => upscaleCanvas(img), engines: 'both' });
+  }
+
+  for (const step of stage3) {
+    if (Date.now() > deadline) break;
+    await yieldToUi();
+    const hit = await tryDecodeCanvas(step.make(), reader, readWasm, step.engines);
+    if (hit) return hit;
+  }
+
   throw new Error('not found');
 }
 
@@ -282,6 +635,7 @@ export default function BarcodeCleaner() {
   const [format, setFormat] = useState<string>(routeFormat);
   const [readMode, setReadMode] = useState<ReadMode>(routeRead);
   const [status, setStatus] = useState<'idle' | 'reading' | 'ok' | 'manual'>('idle');
+  const [readingHint, setReadingHint] = useState('');
   const [error, setError] = useState('');
 
   const getOcrWorker = useCallback(async () => {
@@ -351,6 +705,7 @@ export default function BarcodeCleaner() {
   const decodeImage = useCallback(async (url: string) => {
     setStatus('reading');
     setError('');
+    setReadingHint(readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…');
     try {
       if (readMode === 'numbers') {
         const img = await loadImage(url);
@@ -373,8 +728,8 @@ export default function BarcodeCleaner() {
         if (digits.length < OCR_MIN_DIGITS) throw new Error('not found');
         finishRead(digits);
       } else {
-        const result = await decodeBarcode(url);
-        finishRead(result.getText(), mapZxingFormat(result.getBarcodeFormat()));
+        const result = await decodeBarcode(url, setReadingHint);
+        finishRead(result.text, result.format);
       }
     } catch {
       failRead();
@@ -522,7 +877,7 @@ export default function BarcodeCleaner() {
             )}
             {status === 'reading' && (
               <p className="text-sm text-ed-muted">
-                {readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…'}
+                {readingHint || (readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…')}
               </p>
             )}
             {error && <p className="text-sm text-danger-600">{error}</p>}
@@ -568,7 +923,7 @@ export default function BarcodeCleaner() {
                 <div className="text-sm">
                   {status === 'reading' && (
                     <p className="text-ed-muted">
-                      {readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…'}
+                      {readingHint || (readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…')}
                     </p>
                   )}
                   {status === 'ok' && <p className="text-ed-accent font-medium">Barcode read: {code}</p>}
