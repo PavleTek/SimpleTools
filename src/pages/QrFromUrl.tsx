@@ -1,14 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
-import { ArrowDownTrayIcon, QrCodeIcon } from '@heroicons/react/24/outline';
-import { FORMAT_OPTIONS, scanUrl, type ReadMode } from '../lib/barcodeFormats';
+import { ArrowDownTrayIcon } from '@heroicons/react/24/outline';
 import {
   pageCardClass,
-  pageChoiceCardClass,
-  pageInputClass,
-  pageLabelClass,
   pagePrimaryButtonClass,
   pageSubtitleClass,
+  pageTextareaClass,
   pageTitleClass,
 } from '../lib/pageUi';
 
@@ -26,6 +23,16 @@ function filenameDate(): string {
   return `${dd}-${mm}-${yy}`;
 }
 
+function filenameFromText(text: string): string {
+  try {
+    const host = new URL(text.trim()).hostname.replace(/^www\./, '');
+    if (host) return sanitizeFilenamePart(host) || 'text';
+  } catch {
+    // not a URL
+  }
+  return sanitizeFilenamePart(text).slice(0, 40) || 'text';
+}
+
 async function drawQr(dest: HTMLCanvasElement, value: string) {
   dest.width = CANVAS_SIZE;
   dest.height = CANVAS_SIZE;
@@ -35,46 +42,28 @@ async function drawQr(dest: HTMLCanvasElement, value: string) {
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
-  if (!value) return;
+  if (!value.trim()) return;
 
   const qrCanvas = document.createElement('canvas');
-  await QRCode.toCanvas(qrCanvas, value, {
+  await QRCode.toCanvas(qrCanvas, value.trim(), {
     errorCorrectionLevel: 'H',
     margin: 2,
-    width: 720,
+    width: 860,
     color: {
       dark: '#111111',
       light: '#ffffff',
     },
   });
 
-  const size = 720;
-  const x = (CANVAS_SIZE - size) / 2;
-  const y = 100;
-  ctx.drawImage(qrCanvas, x, y, size, size);
-
-  ctx.fillStyle = '#333333';
-  ctx.font = '400 24px "Hanken Grotesk", ui-sans-serif, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(value, CANVAS_SIZE / 2, y + size + 56, 860);
+  const size = 860;
+  const xy = (CANVAS_SIZE - size) / 2;
+  ctx.drawImage(qrCanvas, xy, xy, size, size);
 }
 
 export default function QrFromUrl() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [format, setFormat] = useState('CODE128');
-  const [readMode, setReadMode] = useState<ReadMode>('barcode');
-  const [origin, setOrigin] = useState('');
+  const [text, setText] = useState('');
   const [error, setError] = useState('');
-
-  useEffect(() => {
-    setOrigin(window.location.origin);
-  }, []);
-
-  const encoded = useMemo(
-    () => (origin ? scanUrl(format, origin, readMode) : ''),
-    [format, origin, readMode],
-  );
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -83,28 +72,28 @@ export default function QrFromUrl() {
 
     void (async () => {
       try {
-        await drawQr(canvas, encoded);
+        await drawQr(canvas, text);
         if (!cancelled) setError('');
       } catch {
-        if (!cancelled) setError('Could not generate a QR code for this URL.');
+        if (!cancelled) setError('Could not generate a QR code for this text.');
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [encoded]);
+  }, [text]);
 
   const downloadJpg = () => {
     const canvas = canvasRef.current;
-    if (!canvas || !encoded || error) return;
+    if (!canvas || !text.trim() || error) return;
     canvas.toBlob(
       (blob) => {
         if (!blob) return;
         const objectUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = objectUrl;
-        a.download = `QRCode_scan_${sanitizeFilenamePart(format)}_${readMode}_${filenameDate()}.jpg`;
+        a.download = `QRCode_${filenameFromText(text)}_${filenameDate()}.jpg`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -115,93 +104,29 @@ export default function QrFromUrl() {
     );
   };
 
-  const canDownload = Boolean(encoded) && !error;
-  const onLan = origin.startsWith('https://') || origin.startsWith('http://');
-  const looksLocal = /localhost|127\.0\.0\.1/.test(origin);
+  const canDownload = Boolean(text.trim()) && !error;
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className={pageTitleClass}>QR generator</h1>
-          <p className={pageSubtitleClass}>
-            Print this QR. Phones that scan it open the barcode cleaner with the camera ready.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={downloadJpg}
-          disabled={!canDownload}
-          className={pagePrimaryButtonClass}
-        >
-          <ArrowDownTrayIcon className="h-5 w-5" />
-          Download JPG
-        </button>
+      <div>
+        <h1 className={pageTitleClass}>QR generator</h1>
+        <p className={pageSubtitleClass}>Paste text. Download a square JPG of the QR code.</p>
       </div>
 
       <section className={pageCardClass}>
-        <h2 className="text-xl font-semibold text-ed-ink mb-4 flex items-center gap-2">
-          <QrCodeIcon className="h-5 w-5" />
-          Scanner link
-        </h2>
-        <div>
-          <label className={pageLabelClass}>Barcode format</label>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            {FORMAT_OPTIONS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => setFormat(opt.value)}
-                className={pageChoiceCardClass(format === opt.value)}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="mt-5">
-          <label className={pageLabelClass}>Read</label>
-          <div className="grid grid-cols-2 gap-2">
-            <button
-              type="button"
-              className={pageChoiceCardClass(readMode === 'barcode')}
-              onClick={() => setReadMode('barcode')}
-            >
-              Barcode
-            </button>
-            <button
-              type="button"
-              className={pageChoiceCardClass(readMode === 'numbers')}
-              onClick={() => setReadMode('numbers')}
-            >
-              Numbers
-            </button>
-          </div>
-        </div>
-        <div className="mt-5">
-          <label className={pageLabelClass} htmlFor="scan-url">
-            URL in the QR
-          </label>
-          <input
-            id="scan-url"
-            type="text"
-            readOnly
-            value={encoded}
-            className={`${pageInputClass} cursor-text`}
-            onFocus={(e) => e.currentTarget.select()}
-          />
-          {looksLocal && onLan && (
-            <p className="mt-2 text-sm text-danger-600">
-              This QR uses localhost. Open SimpleTools from your phone IP first, then generate the QR again.
-            </p>
-          )}
-          {error && <p className="mt-2 text-sm text-danger-600">{error}</p>}
-        </div>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Paste text or a URL"
+          className={`${pageTextareaClass} min-h-[6rem]`}
+          spellCheck={false}
+        />
+        {error && <p className="mt-2 text-sm text-danger-600">{error}</p>}
       </section>
 
       <section className={pageCardClass}>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          <h2 className="text-xl font-semibold text-ed-ink">Clean image</h2>
+          <h2 className="text-xl font-semibold text-ed-ink">QR</h2>
           <button
             type="button"
             onClick={downloadJpg}

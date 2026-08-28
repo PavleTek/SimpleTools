@@ -18,7 +18,7 @@ const TOOLS = [
   {
     to: '/qr',
     title: 'QR generator',
-    description: 'Make a QR that opens the barcode scanner with the camera ready.',
+    description: 'Paste text or a URL and download a clean square JPG of the QR code.',
     icon: LinkIcon,
   },
 ];
