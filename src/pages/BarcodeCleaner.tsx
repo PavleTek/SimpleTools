@@ -3,7 +3,7 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
 import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import JsBarcode from 'jsbarcode';
-import { createWorker, type Worker as OcrWorker } from 'tesseract.js';
+import { createWorker, PSM, type Worker as OcrWorker } from 'tesseract.js';
 import {
   ArrowDownTrayIcon,
   ArrowUpTrayIcon,
@@ -32,7 +32,10 @@ import {
 
 const CANVAS_SIZE = 1000;
 const GUIDE_WIDTH = 0.9;
-const GUIDE_HEIGHT = 0.18;
+const GUIDE_HEIGHT = 0.18 * 1.25;
+const OCR_MIN_DIGITS = 6;
+const OCR_SAMPLE_TARGET = 6;
+const OCR_TICK_MS = 450;
 
 function isPhoneDevice() {
   if (typeof navigator === 'undefined') return false;
@@ -144,8 +147,31 @@ function cropGuideFromVideo(video: HTMLVideoElement, container: HTMLElement): HT
 }
 
 function extractDigits(text: string): string {
+  // The scan frame is a single number; join digits so spaces/noise do not drop digits.
+  const compact = text.replace(/\D/g, '');
+  if (compact) return compact;
   const runs = text.match(/\d+/g) ?? [];
   return runs.sort((a, b) => b.length - a.length)[0] ?? '';
+}
+
+function pickBestDigits(samples: string[]): string {
+  const usable = samples.filter((sample) => sample.length >= OCR_MIN_DIGITS);
+  if (usable.length === 0) return '';
+  const maxLen = Math.max(...usable.map((sample) => sample.length));
+  const longest = usable.filter((sample) => sample.length === maxLen);
+  const counts = new Map<string, number>();
+  for (const sample of longest) {
+    counts.set(sample, (counts.get(sample) ?? 0) + 1);
+  }
+  let best = longest[0];
+  let bestCount = 0;
+  for (const [value, count] of counts) {
+    if (count > bestCount) {
+      best = value;
+      bestCount = count;
+    }
+  }
+  return best;
 }
 
 async function decodeBarcode(url: string) {
@@ -288,6 +314,7 @@ export default function BarcodeCleaner() {
       const worker = await createWorker('eng');
       await worker.setParameters({
         tessedit_char_whitelist: '0123456789',
+        tessedit_pageseg_mode: PSM.SINGLE_LINE,
       });
       ocrWorkerRef.current = worker;
     }
@@ -378,6 +405,7 @@ export default function BarcodeCleaner() {
           video.srcObject = stream;
           await video.play();
           const worker = await getOcrWorker();
+          const samples: string[] = [];
           const tick = async () => {
             if (cancelled) return;
             const box = cameraBoxRef.current;
@@ -387,8 +415,11 @@ export default function BarcodeCleaner() {
                 try {
                   const { data } = await worker.recognize(crop);
                   const digits = extractDigits(data.text);
-                  if (digits.length >= 6) {
-                    finishScan(digits);
+                  if (digits.length >= OCR_MIN_DIGITS) {
+                    samples.push(digits);
+                  }
+                  if (samples.length >= OCR_SAMPLE_TARGET) {
+                    finishScan(pickBestDigits(samples));
                     return;
                   }
                 } catch {
@@ -396,7 +427,7 @@ export default function BarcodeCleaner() {
                 }
               }
             }
-            if (!cancelled) ocrTimer = window.setTimeout(() => void tick(), 700);
+            if (!cancelled) ocrTimer = window.setTimeout(() => void tick(), OCR_TICK_MS);
           };
           void tick();
         } catch {
@@ -460,9 +491,15 @@ export default function BarcodeCleaner() {
       if (readMode === 'numbers') {
         const img = await loadImage(url);
         const worker = await getOcrWorker();
+        const samples: string[] = [];
         const { data } = await worker.recognize(img);
-        const digits = extractDigits(data.text);
-        if (digits.length < 6) throw new Error('not found');
+        samples.push(extractDigits(data.text));
+        for (const contrast of [1.4, 2, 2.8]) {
+          const { data: contrasted } = await worker.recognize(contrastCanvas(img, contrast));
+          samples.push(extractDigits(contrasted.text));
+        }
+        const digits = pickBestDigits(samples);
+        if (digits.length < OCR_MIN_DIGITS) throw new Error('not found');
         setCode(digits);
       } else {
         const result = await decodeBarcode(url);
