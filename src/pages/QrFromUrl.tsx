@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import { ArrowDownTrayIcon, QrCodeIcon } from '@heroicons/react/24/outline';
-import { FORMAT_OPTIONS, scanUrl } from '../lib/barcodeFormats';
+import { FORMAT_OPTIONS, scanUrl, type ReadMode } from '../lib/barcodeFormats';
 import {
   pageCardClass,
   pageChoiceCardClass,
@@ -63,6 +63,7 @@ async function drawQr(dest: HTMLCanvasElement, value: string) {
 export default function QrFromUrl() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [format, setFormat] = useState('CODE128');
+  const [readMode, setReadMode] = useState<ReadMode>('barcode');
   const [origin, setOrigin] = useState('');
   const [error, setError] = useState('');
 
@@ -70,7 +71,10 @@ export default function QrFromUrl() {
     setOrigin(window.location.origin);
   }, []);
 
-  const encoded = useMemo(() => (origin ? scanUrl(format, origin) : ''), [format, origin]);
+  const encoded = useMemo(
+    () => (origin ? scanUrl(format, origin, readMode) : ''),
+    [format, origin, readMode],
+  );
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -100,7 +104,7 @@ export default function QrFromUrl() {
         const objectUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = objectUrl;
-        a.download = `QRCode_scan_${sanitizeFilenamePart(format)}_${filenameDate()}.jpg`;
+        a.download = `QRCode_scan_${sanitizeFilenamePart(format)}_${readMode}_${filenameDate()}.jpg`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -153,6 +157,25 @@ export default function QrFromUrl() {
                 {opt.label}
               </button>
             ))}
+          </div>
+        </div>
+        <div className="mt-5">
+          <label className={pageLabelClass}>Read</label>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              className={pageChoiceCardClass(readMode === 'barcode')}
+              onClick={() => setReadMode('barcode')}
+            >
+              Barcode
+            </button>
+            <button
+              type="button"
+              className={pageChoiceCardClass(readMode === 'numbers')}
+              onClick={() => setReadMode('numbers')}
+            >
+              Numbers
+            </button>
           </div>
         </div>
         <div className="mt-5">

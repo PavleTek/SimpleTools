@@ -12,6 +12,7 @@ export default function App() {
         <Route path="/" element={<Home />} />
         <Route path="/scan" element={<BarcodeCleaner />} />
         <Route path="/scan/:format" element={<BarcodeCleaner />} />
+        <Route path="/scan/:format/:read" element={<BarcodeCleaner />} />
         <Route path="/barcode-cleaner" element={<Navigate to="/scan" replace />} />
         <Route path="/md-to-pdf" element={<MdToPdf />} />
         <Route path="/qr" element={<QrFromUrl />} />

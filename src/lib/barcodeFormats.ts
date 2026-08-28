@@ -52,10 +52,30 @@ export function formatToZxing(format: string): BarcodeFormat {
   }
 }
 
-export function scanPath(format: string = 'CODE128'): string {
+export const READ_MODES = [
+  { label: 'Barcode', value: 'barcode' },
+  { label: 'Numbers', value: 'numbers' },
+] as const;
+
+export type ReadMode = (typeof READ_MODES)[number]['value'];
+
+export function parseReadParam(raw: string | undefined): ReadMode | null {
+  if (!raw) return null;
+  const key = raw.trim().toLowerCase();
+  if (key === 'numbers' || key === 'number' || key === 'ocr' || key === 'digits') return 'numbers';
+  if (key === 'barcode' || key === 'bars' || key === 'code') return 'barcode';
+  return null;
+}
+
+export function scanPath(format: string = 'CODE128', read: ReadMode = 'barcode'): string {
+  if (read === 'numbers') return `/scan/${format}/numbers`;
   return `/scan/${format}`;
 }
 
-export function scanUrl(format: string = 'CODE128', origin = window.location.origin): string {
-  return `${origin}${scanPath(format)}`;
+export function scanUrl(
+  format: string = 'CODE128',
+  origin = window.location.origin,
+  read: ReadMode = 'barcode',
+): string {
+  return `${origin}${scanPath(format, read)}`;
 }

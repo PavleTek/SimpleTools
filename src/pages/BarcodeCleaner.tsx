@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
 import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import JsBarcode from 'jsbarcode';
+import { createWorker, type Worker as OcrWorker } from 'tesseract.js';
 import {
   ArrowDownTrayIcon,
   ArrowUpTrayIcon,
@@ -14,10 +15,13 @@ import {
   FORMAT_OPTIONS,
   formatToZxing,
   parseFormatParam,
+  parseReadParam,
   scanPath,
+  type ReadMode,
 } from '../lib/barcodeFormats';
 import {
   pageCardClass,
+  pageChoiceCardClass,
   pageInputClass,
   pageLabelClass,
   pagePrimaryButtonClass,
@@ -27,6 +31,8 @@ import {
 } from '../lib/pageUi';
 
 const CANVAS_SIZE = 1000;
+const GUIDE_WIDTH = 0.9;
+const GUIDE_HEIGHT = 0.18;
 
 function isPhoneDevice() {
   if (typeof navigator === 'undefined') return false;
@@ -100,6 +106,46 @@ function contrastCanvas(img: HTMLImageElement, contrast: number): HTMLCanvasElem
   ctx.filter = `grayscale(1) contrast(${contrast})`;
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
   return canvas;
+}
+
+function cropGuideFromVideo(video: HTMLVideoElement, container: HTMLElement): HTMLCanvasElement | null {
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh || !cw || !ch) return null;
+
+  const scale = Math.max(cw / vw, ch / vh);
+  const dispW = vw * scale;
+  const dispH = vh * scale;
+  const offX = (cw - dispW) / 2;
+  const offY = (ch - dispH) / 2;
+
+  const boxW = cw * GUIDE_WIDTH;
+  const boxH = ch * GUIDE_HEIGHT;
+  const boxX = (cw - boxW) / 2;
+  const boxY = (ch - boxH) / 2;
+
+  const sx = (boxX - offX) / scale;
+  const sy = (boxY - offY) / scale;
+  const sw = boxW / scale;
+  const sh = boxH / scale;
+
+  const canvas = document.createElement('canvas');
+  const outW = 1200;
+  const outH = Math.max(80, Math.round(outW * (sh / sw)));
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.filter = 'grayscale(1) contrast(1.6)';
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, outW, outH);
+  return canvas;
+}
+
+function extractDigits(text: string): string {
+  const runs = text.match(/\d+/g) ?? [];
+  return runs.sort((a, b) => b.length - a.length)[0] ?? '';
 }
 
 async function decodeBarcode(url: string) {
@@ -187,7 +233,7 @@ function drawTicket(
     background: '#ffffff',
     lineColor: '#000000',
     width: 4,
-    height: 220,
+    height: 250,
   };
 
   try {
@@ -196,28 +242,35 @@ function drawTicket(
     JsBarcode(barcodeCanvas, code.trim(), { ...barcodeOptions, format: 'CODE128' });
   }
 
-  const maxW = 800;
-  const maxH = 280;
+  const maxW = 900;
+  const maxH = 320;
   const scale = Math.min(maxW / barcodeCanvas.width, maxH / barcodeCanvas.height);
   const dw = barcodeCanvas.width * scale;
   const dh = barcodeCanvas.height * scale;
-  const barcodeY = 360;
+  const barcodeY = 340;
   ctx.drawImage(barcodeCanvas, (CANVAS_SIZE - dw) / 2, barcodeY, dw, dh);
 
   ctx.fillStyle = '#111111';
-  ctx.font = '500 34px "Hanken Grotesk", ui-sans-serif, sans-serif';
-  ctx.fillText(code.trim().split('').join(' '), CANVAS_SIZE / 2, barcodeY + dh + 56, 860);
+  ctx.font = '500 40px "Hanken Grotesk", ui-sans-serif, sans-serif';
+  ctx.fillText(code.trim().split('').join(' '), CANVAS_SIZE / 2, barcodeY + dh + 62, 920);
 }
 
 export default function BarcodeCleaner() {
-  const { format: formatParam } = useParams();
+  const { format: formatParam, read: readParam } = useParams();
   const navigate = useNavigate();
-  const routeFormat = parseFormatParam(formatParam) ?? 'CODE128';
+  const location = useLocation();
+  const formatIsRead = Boolean(parseReadParam(formatParam) && !readParam);
+  const routeRead: ReadMode = formatIsRead
+    ? (parseReadParam(formatParam) ?? 'barcode')
+    : (parseReadParam(readParam) ?? 'barcode');
+  const routeFormat = formatIsRead ? 'CODE128' : (parseFormatParam(formatParam) ?? 'CODE128');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const cameraBoxRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<IScannerControls | null>(null);
+  const ocrWorkerRef = useRef<OcrWorker | null>(null);
   const autoStartedRef = useRef(false);
 
   const [isPhone, setIsPhone] = useState(false);
@@ -226,8 +279,27 @@ export default function BarcodeCleaner() {
   const [dateTime, setDateTime] = useState('');
   const [code, setCode] = useState('');
   const [format, setFormat] = useState<string>(routeFormat);
+  const [readMode, setReadMode] = useState<ReadMode>(routeRead);
   const [status, setStatus] = useState<'idle' | 'reading' | 'ok' | 'manual'>('idle');
   const [error, setError] = useState('');
+
+  const getOcrWorker = useCallback(async () => {
+    if (!ocrWorkerRef.current) {
+      const worker = await createWorker('eng');
+      await worker.setParameters({
+        tessedit_char_whitelist: '0123456789',
+      });
+      ocrWorkerRef.current = worker;
+    }
+    return ocrWorkerRef.current;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      void ocrWorkerRef.current?.terminate();
+      ocrWorkerRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     const phone = isPhoneDevice();
@@ -240,10 +312,12 @@ export default function BarcodeCleaner() {
 
   useEffect(() => {
     setFormat(routeFormat);
-    if (!formatParam) {
-      navigate(scanPath(routeFormat), { replace: true });
+    setReadMode(routeRead);
+    const canonical = scanPath(routeFormat, routeRead);
+    if (location.pathname !== canonical) {
+      navigate(canonical, { replace: true });
     }
-  }, [formatParam, navigate, routeFormat]);
+  }, [location.pathname, navigate, routeFormat, routeRead]);
 
   useEffect(() => {
     return () => {
@@ -263,8 +337,83 @@ export default function BarcodeCleaner() {
     if (!video) return;
 
     let cancelled = false;
-    const reader = createLiveReader(format);
+    let ocrTimer: number | undefined;
 
+    const finishScan = (value: string) => {
+      if (cancelled || !value) return;
+      cancelled = true;
+      setCode(value);
+      setStatus('ok');
+      setDateTime((prev) => prev || nowTicketDate());
+      setError('');
+      setScanning(false);
+      window.setTimeout(() => {
+        canvasRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 80);
+    };
+
+    const stopVideo = () => {
+      const stream = video.srcObject;
+      if (stream instanceof MediaStream) {
+        stream.getTracks().forEach((track) => track.stop());
+        video.srcObject = null;
+      }
+    };
+
+    if (readMode === 'numbers') {
+      void (async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+              facingMode: { ideal: 'environment' },
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+            },
+          });
+          if (cancelled) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+          video.srcObject = stream;
+          await video.play();
+          const worker = await getOcrWorker();
+          const tick = async () => {
+            if (cancelled) return;
+            const box = cameraBoxRef.current;
+            if (box && video.readyState >= 2) {
+              const crop = cropGuideFromVideo(video, box);
+              if (crop) {
+                try {
+                  const { data } = await worker.recognize(crop);
+                  const digits = extractDigits(data.text);
+                  if (digits.length >= 6) {
+                    finishScan(digits);
+                    return;
+                  }
+                } catch {
+                  // keep scanning
+                }
+              }
+            }
+            if (!cancelled) ocrTimer = window.setTimeout(() => void tick(), 700);
+          };
+          void tick();
+        } catch {
+          if (cancelled) return;
+          setScanning(false);
+          setError('Could not open the camera. Allow camera access and try again.');
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+        if (ocrTimer) window.clearTimeout(ocrTimer);
+        stopVideo();
+      };
+    }
+
+    const reader = createLiveReader(format);
     void reader
       .decodeFromConstraints(
         {
@@ -278,17 +427,9 @@ export default function BarcodeCleaner() {
         video,
         (result, _err, controls) => {
           if (cancelled || !result) return;
-          cancelled = true;
           controls.stop();
           controlsRef.current = null;
-          setCode(result.getText());
-          setStatus('ok');
-          setDateTime((prev) => prev || nowTicketDate());
-          setError('');
-          setScanning(false);
-          window.setTimeout(() => {
-            canvasRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }, 80);
+          finishScan(result.getText());
         },
       )
       .then((controls) => {
@@ -308,27 +449,36 @@ export default function BarcodeCleaner() {
       cancelled = true;
       controlsRef.current?.stop();
       controlsRef.current = null;
-      const stream = video.srcObject;
-      if (stream instanceof MediaStream) {
-        stream.getTracks().forEach((track) => track.stop());
-        video.srcObject = null;
-      }
+      stopVideo();
     };
-  }, [scanning, format]);
+  }, [scanning, format, readMode, getOcrWorker]);
 
   const decodeImage = useCallback(async (url: string) => {
     setStatus('reading');
     setError('');
     try {
-      const result = await decodeBarcode(url);
-      setCode(result.getText());
-      setFormat(mapZxingFormat(result.getBarcodeFormat()));
+      if (readMode === 'numbers') {
+        const img = await loadImage(url);
+        const worker = await getOcrWorker();
+        const { data } = await worker.recognize(img);
+        const digits = extractDigits(data.text);
+        if (digits.length < 6) throw new Error('not found');
+        setCode(digits);
+      } else {
+        const result = await decodeBarcode(url);
+        setCode(result.getText());
+        setFormat(mapZxingFormat(result.getBarcodeFormat()));
+      }
       setStatus('ok');
     } catch {
       setStatus('manual');
-      setError('Could not read the barcode. Type the number below.');
+      setError(
+        readMode === 'numbers'
+          ? 'Could not read the numbers. Type the number below.'
+          : 'Could not read the barcode. Type the number below.',
+      );
     }
-  }, []);
+  }, [getOcrWorker, readMode]);
 
   const handleFile = useCallback(
     (file: File) => {
@@ -383,7 +533,9 @@ export default function BarcodeCleaner() {
           <h1 className={pageTitleClass}>Barcode cleaner</h1>
           <p className={pageSubtitleClass}>
             {isPhone
-              ? 'Point the camera at the barcode. A clean JPG is created as soon as it is read.'
+              ? readMode === 'numbers'
+                ? 'Point the camera at the printed number. A clean JPG is created as soon as it is read.'
+                : 'Point the camera at the barcode. A clean JPG is created as soon as it is read.'
               : 'Upload a photo of a ticket. Get a clean square JPG with the same barcode.'}
           </p>
         </div>
@@ -406,7 +558,7 @@ export default function BarcodeCleaner() {
 
         {isPhone ? (
           scanning ? (
-            <div className="relative overflow-hidden rounded-[20px] bg-black aspect-square">
+            <div ref={cameraBoxRef} className="relative overflow-hidden rounded-[20px] bg-black aspect-square">
               <video
                 ref={videoRef}
                 className="absolute inset-0 h-full w-full object-cover"
@@ -415,10 +567,15 @@ export default function BarcodeCleaner() {
                 autoPlay
               />
               <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-                <div className="w-[78%] aspect-square rounded-[16px] ring-2 ring-white shadow-[0_0_0_9999px_rgba(0,0,0,0.48)]" />
+                <div
+                  className="rounded-md ring-2 ring-white shadow-[0_0_0_9999px_rgba(0,0,0,0.48)]"
+                  style={{ width: `${GUIDE_WIDTH * 100}%`, height: `${GUIDE_HEIGHT * 100}%` }}
+                />
               </div>
               <p className="pointer-events-none absolute bottom-4 inset-x-3 text-center text-xs font-medium text-white drop-shadow">
-                Line up the barcode and number inside the square
+                {readMode === 'numbers'
+                  ? 'Line up the printed number inside the frame'
+                  : 'Line up the barcode inside the frame'}
               </p>
               <button
                 type="button"
@@ -441,7 +598,11 @@ export default function BarcodeCleaner() {
               >
                 <CameraIcon className="h-10 w-10" />
                 <span className="text-lg font-semibold">Tap to start camera</span>
-                <span className="text-sm text-ed-ink-fg/70">Line up the barcode inside the square</span>
+                <span className="text-sm text-ed-ink-fg/70">
+                  {readMode === 'numbers'
+                    ? 'Line up the printed number inside the frame'
+                    : 'Line up the barcode inside the frame'}
+                </span>
               </button>
               <button
                 type="button"
@@ -461,7 +622,11 @@ export default function BarcodeCleaner() {
                   if (file) handleFile(file);
                 }}
               />
-              {status === 'reading' && <p className="text-sm text-ed-muted">Reading barcode…</p>}
+              {status === 'reading' && (
+                <p className="text-sm text-ed-muted">
+                  {readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…'}
+                </p>
+              )}
               {error && <p className="text-sm text-danger-600">{error}</p>}
               {status === 'ok' && code && (
                 <p className="text-sm font-medium text-ed-accent">Barcode read: {code}</p>
@@ -502,7 +667,11 @@ export default function BarcodeCleaner() {
                   className="h-40 w-40 object-cover rounded-[20px] ring-1 ring-ed-line"
                 />
                 <div className="text-sm">
-                  {status === 'reading' && <p className="text-ed-muted">Reading barcode…</p>}
+                  {status === 'reading' && (
+                    <p className="text-ed-muted">
+                      {readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…'}
+                    </p>
+                  )}
                   {status === 'ok' && <p className="text-ed-accent font-medium">Barcode read: {code}</p>}
                   {status === 'manual' && <p className="text-danger-600">{error}</p>}
                   <button
@@ -539,11 +708,30 @@ export default function BarcodeCleaner() {
               className={pageInputClass}
             />
           </div>
+          <div className="md:col-span-2">
+            <label className={pageLabelClass}>Read</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                className={pageChoiceCardClass(readMode === 'barcode')}
+                onClick={() => navigate(scanPath(format, 'barcode'), { replace: true })}
+              >
+                Barcode
+              </button>
+              <button
+                type="button"
+                className={pageChoiceCardClass(readMode === 'numbers')}
+                onClick={() => navigate(scanPath(format, 'numbers'), { replace: true })}
+              >
+                Numbers
+              </button>
+            </div>
+          </div>
           <div>
             <label className={pageLabelClass}>Barcode format</label>
             <select
               value={format}
-              onChange={(e) => navigate(scanPath(e.target.value), { replace: true })}
+              onChange={(e) => navigate(scanPath(e.target.value, readMode), { replace: true })}
               className={`${pageInputClass} cursor-pointer`}
             >
               {FORMAT_OPTIONS.map((opt) => (
