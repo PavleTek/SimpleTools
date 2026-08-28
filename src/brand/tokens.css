@@ -1,0 +1,112 @@
+/**
+ * SimpleTools design tokens — portal-simple-hora editorial system,
+ * recolored with PavleTek purple / teal.
+ */
+
+@theme {
+  --font-headline: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+
+  --color-primary-50: #f2e8ff;
+  --color-primary-100: #d3bfff;
+  --color-primary-200: #b497ff;
+  --color-primary-300: #9570ff;
+  --color-primary-400: #7548ff;
+  --color-primary-500: #5321e0;
+  --color-primary-600: #3d19a8;
+  --color-primary-700: #2c1378;
+  --color-primary-800: #220070;
+  --color-primary-900: #18004f;
+
+  --color-secondary-50: #e6f9f4;
+  --color-secondary-100: #c2efe3;
+  --color-secondary-200: #9ee4d3;
+  --color-secondary-300: #7ad9c5;
+  --color-secondary-400: #5bbfae;
+  --color-secondary-500: #43a898;
+  --color-secondary-600: #348579;
+  --color-secondary-700: #26615b;
+  --color-secondary-800: #193e3c;
+  --color-secondary-900: #0d1f1e;
+
+  --color-success-50: #ecfdf5;
+  --color-success-100: #d1fae5;
+  --color-success-500: #10b981;
+  --color-success-600: #059669;
+
+  --color-danger-50: #fef2f2;
+  --color-danger-100: #fee2e2;
+  --color-danger-500: #ef4444;
+  --color-danger-600: #dc2626;
+
+  --shadow-sr-sm: 0 1px 2px rgba(28, 27, 23, 0.04);
+  --shadow-sr-md: 0 4px 12px rgba(28, 27, 23, 0.06);
+  --shadow-sr-lg: 0 10px 30px rgba(28, 27, 23, 0.06);
+  --shadow-sr-xl: 0 20px 50px rgba(28, 27, 23, 0.09);
+
+  --radius-sr-sm: 0.375rem;
+  --radius-sr-md: 0.5rem;
+  --radius-sr-lg: 0.75rem;
+  --radius-sr-xl: 1rem;
+  --radius-sr-2xl: 1.5rem;
+
+  --color-ed-paper: var(--ed-paper);
+  --color-ed-surface: var(--ed-surface);
+  --color-ed-band: var(--ed-band);
+  --color-ed-ink: var(--ed-ink);
+  --color-ed-ink-fg: var(--ed-ink-fg);
+  --color-ed-muted: var(--ed-muted);
+  --color-ed-accent: var(--ed-accent);
+  --color-ed-accent-hover: var(--ed-accent-hover);
+  --color-ed-accent-soft: var(--ed-accent-soft);
+  --color-ed-teal: var(--ed-teal);
+  --color-ed-line: var(--ed-line);
+}
+
+:root {
+  --ed-paper: #ffffff;
+  --ed-surface: #ffffff;
+  --ed-band: #f6f5f2;
+  --ed-ink: #111111;
+  --ed-ink-fg: #ffffff;
+  --ed-muted: #6b6b6b;
+  --ed-accent: #220070;
+  --ed-accent-hover: #2c1378;
+  --ed-accent-soft: color-mix(in srgb, #220070 12%, #ffffff);
+  --ed-teal: #7ad9c5;
+  --ed-line: #ebe8e2;
+
+  --sa-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --sa-duration-soft: 0.4s;
+  --sa-duration-fast: 0.22s;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  background: var(--ed-paper);
+  color: var(--ed-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-headline);
+}
+
+button,
+[role="button"],
+a,
+label[for],
+select,
+input[type="file"],
+input[type="color"] {
+  cursor: pointer;
+}
