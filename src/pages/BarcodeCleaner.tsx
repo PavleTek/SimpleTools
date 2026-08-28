@@ -9,6 +9,7 @@ import {
   ArrowUpTrayIcon,
   CameraIcon,
   PhotoIcon,
+  XMarkIcon,
 } from '@heroicons/react/24/outline';
 import {
   FORMAT_OPTIONS,
@@ -34,6 +35,11 @@ const DECODE_MAX = 2800;
 const VARIANT_MAX = 1600;
 const UPSCALE_MIN = 1000;
 const DECODE_BUDGET_MS = 12_000;
+const SQUARE_GUIDE = 0.86;
+const NUMBER_GUIDE_WIDTH = 0.9;
+const NUMBER_GUIDE_HEIGHT = 0.18 * 1.25 * 1.25;
+const LIVE_BARCODE_MS = 180;
+const LIVE_NUMBERS_MS = 480;
 const WASM_LINEAR_FORMATS = [
   'Code128',
   'Code39',
@@ -335,6 +341,61 @@ function upscaleCanvas(
   return canvas;
 }
 
+function snapshotVideo(video: HTMLVideoElement, max = VARIANT_MAX): HTMLCanvasElement | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const scale = Math.min(1, max / Math.max(vw, vh));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(vw * scale));
+  canvas.height = Math.max(1, Math.round(vh * scale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  fillWhite(ctx, canvas.width, canvas.height);
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function cropGuideFromVideo(
+  video: HTMLVideoElement,
+  container: HTMLElement,
+  guideWidth: number,
+  guideHeight: number,
+  max = VARIANT_MAX,
+): HTMLCanvasElement | null {
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh || !cw || !ch) return null;
+
+  const scale = Math.max(cw / vw, ch / vh);
+  const dispW = vw * scale;
+  const dispH = vh * scale;
+  const offX = (cw - dispW) / 2;
+  const offY = (ch - dispH) / 2;
+
+  const boxW = cw * guideWidth;
+  const boxH = ch * guideHeight;
+  const boxX = (cw - boxW) / 2;
+  const boxY = (ch - boxH) / 2;
+
+  const sx = (boxX - offX) / scale;
+  const sy = (boxY - offY) / scale;
+  const sw = boxW / scale;
+  const sh = boxH / scale;
+
+  const canvas = document.createElement('canvas');
+  const outScale = Math.min(1, max / Math.max(sw, sh));
+  canvas.width = Math.max(1, Math.round(sw * outScale));
+  canvas.height = Math.max(1, Math.round(sh * outScale));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  fillWhite(ctx, canvas.width, canvas.height);
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
 function yieldToUi() {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, 0);
@@ -424,6 +485,22 @@ async function tryDecodeCanvas(
   } catch {
     return null;
   }
+}
+
+async function decodeLiveFrame(
+  canvas: HTMLCanvasElement,
+  reader: BrowserMultiFormatReader,
+  readWasm: WasmReadBarcodes | null,
+  variantIndex: number,
+): Promise<DecodeHit | null> {
+  const variants = [
+    () => canvas,
+    () => contrastCanvas(canvas, 1.6, VARIANT_MAX),
+    () => contrastCanvas(canvas, 2.4, VARIANT_MAX),
+    () => thresholdCanvas(canvas, VARIANT_MAX),
+    () => invertCanvas(canvas, VARIANT_MAX),
+  ];
+  return tryDecodeCanvas(variants[variantIndex % variants.length](), reader, readWasm, 'both');
 }
 
 function extractDigits(text: string): string {
@@ -622,13 +699,17 @@ export default function BarcodeCleaner() {
     : (parseReadParam(readParam) ?? 'barcode');
   const routeFormat = formatIsRead ? 'CODE128' : (parseFormatParam(formatParam) ?? 'CODE128');
 
-  const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const cameraBoxRef = useRef<HTMLDivElement>(null);
   const ocrWorkerRef = useRef<OcrWorker | null>(null);
+  const autoStartedRef = useRef(false);
+  const liveBusyRef = useRef(false);
 
   const [isPhone, setIsPhone] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [dateTime, setDateTime] = useState('');
   const [code, setCode] = useState('');
@@ -658,8 +739,57 @@ export default function BarcodeCleaner() {
   }, []);
 
   useEffect(() => {
-    setIsPhone(isPhoneDevice());
+    const phone = isPhoneDevice();
+    setIsPhone(phone);
+    if (phone && !autoStartedRef.current) {
+      autoStartedRef.current = true;
+      setScanning(true);
+    }
   }, []);
+
+  useEffect(() => {
+    if (!scanning) return;
+    const video = videoRef.current;
+    if (!video) return;
+
+    let cancelled = false;
+
+    const stopVideo = () => {
+      const stream = video.srcObject;
+      if (stream instanceof MediaStream) {
+        stream.getTracks().forEach((track) => track.stop());
+        video.srcObject = null;
+      }
+    };
+
+    void (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          },
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        video.srcObject = stream;
+        await video.play();
+      } catch {
+        if (cancelled) return;
+        setScanning(false);
+        setError('Could not open the camera. Allow camera access and try again.');
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      stopVideo();
+    };
+  }, [scanning]);
 
   useEffect(() => {
     setFormat(routeFormat);
@@ -701,6 +831,75 @@ export default function BarcodeCleaner() {
         : 'Could not read the barcode. Type the number below.',
     );
   }, [readMode]);
+
+  useEffect(() => {
+    if (!scanning) return;
+
+    let cancelled = false;
+    let variantIndex = 0;
+    const reader = createReader();
+    const delay = readMode === 'numbers' ? LIVE_NUMBERS_MS : LIVE_BARCODE_MS;
+
+    const tick = async () => {
+      if (cancelled || liveBusyRef.current) return;
+      const video = videoRef.current;
+      const box = cameraBoxRef.current;
+      if (!video || video.readyState < 2) return;
+
+      liveBusyRef.current = true;
+      try {
+        if (readMode === 'numbers') {
+          const crop = box
+            ? cropGuideFromVideo(video, box, NUMBER_GUIDE_WIDTH, NUMBER_GUIDE_HEIGHT)
+            : snapshotVideo(video);
+          if (!crop) return;
+          const worker = await getOcrWorker();
+          if (cancelled) return;
+          await worker.setParameters({
+            tessedit_char_whitelist: '0123456789',
+            tessedit_pageseg_mode: variantIndex % 2 === 0 ? PSM.SINGLE_LINE : PSM.SINGLE_BLOCK,
+          });
+          const source = variantIndex % 3 === 2 ? contrastCanvas(crop, 2.2, VARIANT_MAX) : crop;
+          const { data } = await worker.recognize(source);
+          if (cancelled) return;
+          const digits = extractDigits(data.text);
+          if (digits.length >= OCR_MIN_DIGITS) {
+            finishRead(digits);
+            setScanning(false);
+            return;
+          }
+        } else {
+          const frame = snapshotVideo(video);
+          if (!frame) return;
+          const readWasm = await getWasmRead();
+          if (cancelled) return;
+          const hit = await decodeLiveFrame(frame, reader, readWasm, variantIndex);
+          if (cancelled) return;
+          if (hit) {
+            finishRead(hit.text, hit.format);
+            setScanning(false);
+            return;
+          }
+        }
+        variantIndex += 1;
+      } catch {
+        // Keep the camera open and try the next frame.
+      } finally {
+        liveBusyRef.current = false;
+      }
+    };
+
+    const id = window.setInterval(() => {
+      void tick();
+    }, delay);
+    void tick();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      liveBusyRef.current = false;
+    };
+  }, [finishRead, getOcrWorker, readMode, scanning]);
 
   const decodeImage = useCallback(async (url: string) => {
     setStatus('reading');
@@ -794,9 +993,9 @@ export default function BarcodeCleaner() {
     setCode('');
     setStatus('idle');
     setError('');
-    if (cameraInputRef.current) cameraInputRef.current.value = '';
     if (galleryInputRef.current) galleryInputRef.current.value = '';
     if (fileInputRef.current) fileInputRef.current.value = '';
+    setScanning(false);
   };
 
   return (
@@ -807,8 +1006,8 @@ export default function BarcodeCleaner() {
           <p className={pageSubtitleClass}>
             {isPhone
               ? readMode === 'numbers'
-                ? 'Take a photo of the printed number with your phone camera. The whole picture is read.'
-                : 'Take a photo of the barcode with your phone camera. The whole picture is read.'
+                ? 'Line the printed number up in the box. The camera keeps trying until it reads it.'
+                : 'Point the camera at the barcode. It keeps trying until it reads it.'
               : 'Upload a photo of a ticket. Get a clean square JPG with the same barcode.'}
           </p>
         </div>
@@ -830,66 +1029,95 @@ export default function BarcodeCleaner() {
         </h2>
 
         {isPhone ? (
-          <div className="flex flex-col items-center gap-3 text-center">
-            <button
-              type="button"
-              className="cursor-pointer w-full aspect-square max-h-[420px] rounded-[20px] bg-ed-ink text-ed-ink-fg flex flex-col items-center justify-center gap-3 px-6"
-              onClick={() => {
-                setError('');
-                cameraInputRef.current?.click();
-              }}
-            >
-              <CameraIcon className="h-10 w-10" />
-              <span className="text-lg font-semibold">Take a photo</span>
-              <span className="text-sm text-ed-ink-fg/70">
-                Opens your phone camera, then reads the whole picture
-              </span>
-            </button>
-            <button
-              type="button"
-              className={pageSecondaryButtonClass}
-              onClick={() => galleryInputRef.current?.click()}
-            >
-              <PhotoIcon className="h-5 w-5" />
-              Choose from photos
-            </button>
-            <input
-              ref={cameraInputRef}
-              type="file"
-              accept="image/*"
-              capture="environment"
-              className="hidden"
-              onChange={(e) => onFileChange(e.currentTarget)}
-            />
-            <input
-              ref={galleryInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => onFileChange(e.currentTarget)}
-            />
-            {sourceUrl && (
-              <img
-                src={sourceUrl}
-                alt="Captured ticket"
-                className="h-40 w-40 object-cover rounded-[20px] ring-1 ring-ed-line"
+          scanning ? (
+            <div ref={cameraBoxRef} className="relative overflow-hidden rounded-[20px] bg-black aspect-square">
+              <video
+                ref={videoRef}
+                className="absolute inset-0 h-full w-full object-cover"
+                playsInline
+                muted
+                autoPlay
               />
-            )}
-            {status === 'reading' && (
-              <p className="text-sm text-ed-muted">
-                {readingHint || (readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…')}
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <div
+                  className="ring-2 ring-white shadow-[0_0_0_9999px_rgba(0,0,0,0.48)]"
+                  style={{
+                    width: `${(readMode === 'numbers' ? NUMBER_GUIDE_WIDTH : SQUARE_GUIDE) * 100}%`,
+                    height: `${(readMode === 'numbers' ? NUMBER_GUIDE_HEIGHT : SQUARE_GUIDE) * 100}%`,
+                    borderRadius: readMode === 'numbers' ? '8px' : '20px',
+                  }}
+                />
+              </div>
+              <p className="pointer-events-none absolute top-4 inset-x-14 text-center text-xs font-medium text-white drop-shadow">
+                {readMode === 'numbers'
+                  ? 'Keep the number in the box — still trying…'
+                  : 'Point at the barcode — still trying…'}
               </p>
-            )}
-            {error && <p className="text-sm text-danger-600">{error}</p>}
-            {status === 'ok' && code && (
-              <p className="text-sm font-medium text-ed-accent">Barcode read: {code}</p>
-            )}
-            {sourceUrl && (
-              <button type="button" className={pageSecondaryButtonClass} onClick={clearPhoto}>
-                Clear photo
+              <button
+                type="button"
+                className="cursor-pointer absolute top-3 right-3 inline-flex h-10 w-10 items-center justify-center rounded-full bg-black/55 text-white"
+                onClick={() => setScanning(false)}
+                aria-label="Close camera"
+              >
+                <XMarkIcon className="h-5 w-5" />
               </button>
-            )}
-          </div>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-3 text-center">
+              <button
+                type="button"
+                className="cursor-pointer w-full aspect-square max-h-[420px] rounded-[20px] bg-ed-ink text-ed-ink-fg flex flex-col items-center justify-center gap-3 px-6"
+                onClick={() => {
+                  setError('');
+                  setScanning(true);
+                }}
+              >
+                <CameraIcon className="h-10 w-10" />
+                <span className="text-lg font-semibold">Tap to scan</span>
+                <span className="text-sm text-ed-ink-fg/70">
+                  {readMode === 'numbers'
+                    ? 'Line up the printed number. The camera keeps trying.'
+                    : 'Point at the barcode. The camera keeps trying.'}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={pageSecondaryButtonClass}
+                onClick={() => galleryInputRef.current?.click()}
+              >
+                <PhotoIcon className="h-5 w-5" />
+                Choose from photos
+              </button>
+              <input
+                ref={galleryInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => onFileChange(e.currentTarget)}
+              />
+              {sourceUrl && (
+                <img
+                  src={sourceUrl}
+                  alt="Captured ticket"
+                  className="h-40 w-40 object-cover rounded-[20px] ring-1 ring-ed-line"
+                />
+              )}
+              {status === 'reading' && (
+                <p className="text-sm text-ed-muted">
+                  {readingHint || (readMode === 'numbers' ? 'Reading numbers…' : 'Reading barcode…')}
+                </p>
+              )}
+              {error && <p className="text-sm text-danger-600">{error}</p>}
+              {status === 'ok' && code && (
+                <p className="text-sm font-medium text-ed-accent">Barcode read: {code}</p>
+              )}
+              {sourceUrl && (
+                <button type="button" className={pageSecondaryButtonClass} onClick={clearPhoto}>
+                  Clear photo
+                </button>
+              )}
+            </div>
+          )
         ) : (
           <>
             <div
