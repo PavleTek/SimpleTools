@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
+import { BrowserMultiFormatReader } from '@zxing/browser';
 import { BarcodeFormat, DecodeHintType } from '@zxing/library';
 import JsBarcode from 'jsbarcode';
 import { createWorker, PSM, type Worker as OcrWorker } from 'tesseract.js';
@@ -32,10 +32,10 @@ import {
 
 const CANVAS_SIZE = 1000;
 const GUIDE_WIDTH = 0.9;
-const GUIDE_HEIGHT = 0.18 * 1.25;
+const GUIDE_HEIGHT = 0.18 * 1.25 * 1.25;
 const OCR_MIN_DIGITS = 6;
 const OCR_SAMPLE_TARGET = 6;
-const OCR_TICK_MS = 450;
+const OCR_TICK_MS = 0;
 
 function isPhoneDevice() {
   if (typeof navigator === 'undefined') return false;
@@ -84,8 +84,8 @@ function createLiveReader(preferredFormat?: string) {
         BarcodeFormat.CODABAR,
       ]);
   return new BrowserMultiFormatReader(hints, {
-    delayBetweenScanAttempts: 200,
-    delayBetweenScanSuccess: 400,
+    delayBetweenScanAttempts: 0,
+    delayBetweenScanSuccess: 0,
   });
 }
 
@@ -111,7 +111,11 @@ function contrastCanvas(img: HTMLImageElement, contrast: number): HTMLCanvasElem
   return canvas;
 }
 
-function cropGuideFromVideo(video: HTMLVideoElement, container: HTMLElement): HTMLCanvasElement | null {
+function cropGuideFromVideo(
+  video: HTMLVideoElement,
+  container: HTMLElement,
+  options?: { outWidth?: number; filter?: string },
+): HTMLCanvasElement | null {
   const cw = container.clientWidth;
   const ch = container.clientHeight;
   const vw = video.videoWidth;
@@ -135,13 +139,13 @@ function cropGuideFromVideo(video: HTMLVideoElement, container: HTMLElement): HT
   const sh = boxH / scale;
 
   const canvas = document.createElement('canvas');
-  const outW = 1200;
+  const outW = options?.outWidth ?? 1200;
   const outH = Math.max(80, Math.round(outW * (sh / sw)));
   canvas.width = outW;
   canvas.height = outH;
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
-  ctx.filter = 'grayscale(1) contrast(1.6)';
+  ctx.filter = options?.filter ?? 'grayscale(1) contrast(1.6)';
   ctx.drawImage(video, sx, sy, sw, sh, 0, 0, outW, outH);
   return canvas;
 }
@@ -295,7 +299,6 @@ export default function BarcodeCleaner() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const cameraBoxRef = useRef<HTMLDivElement>(null);
-  const controlsRef = useRef<IScannerControls | null>(null);
   const ocrWorkerRef = useRef<OcrWorker | null>(null);
   const autoStartedRef = useRef(false);
 
@@ -364,7 +367,7 @@ export default function BarcodeCleaner() {
     if (!video) return;
 
     let cancelled = false;
-    let ocrTimer: number | undefined;
+    let scanTimer: number | undefined;
 
     const finishScan = (value: string) => {
       if (cancelled || !value) return;
@@ -427,7 +430,7 @@ export default function BarcodeCleaner() {
                 }
               }
             }
-            if (!cancelled) ocrTimer = window.setTimeout(() => void tick(), OCR_TICK_MS);
+            if (!cancelled) scanTimer = window.setTimeout(() => void tick(), OCR_TICK_MS);
           };
           void tick();
         } catch {
@@ -439,47 +442,59 @@ export default function BarcodeCleaner() {
 
       return () => {
         cancelled = true;
-        if (ocrTimer) window.clearTimeout(ocrTimer);
+        if (scanTimer) window.clearTimeout(scanTimer);
         stopVideo();
       };
     }
 
-    const reader = createLiveReader(format);
-    void reader
-      .decodeFromConstraints(
-        {
+    void (async () => {
+      const reader = createLiveReader(format);
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
             facingMode: { ideal: 'environment' },
             width: { ideal: 1280 },
             height: { ideal: 720 },
           },
-        },
-        video,
-        (result, _err, controls) => {
-          if (cancelled || !result) return;
-          controls.stop();
-          controlsRef.current = null;
-          finishScan(result.getText());
-        },
-      )
-      .then((controls) => {
+        });
         if (cancelled) {
-          controls.stop();
+          stream.getTracks().forEach((track) => track.stop());
           return;
         }
-        controlsRef.current = controls;
-      })
-      .catch(() => {
+        video.srcObject = stream;
+        await video.play();
+        const tick = () => {
+          if (cancelled) return;
+          const box = cameraBoxRef.current;
+          if (box && video.readyState >= 2) {
+            const crop = cropGuideFromVideo(video, box, {
+              outWidth: 800,
+              filter: '',
+            });
+            if (crop) {
+              try {
+                const result = reader.decodeFromCanvas(crop);
+                finishScan(result.getText());
+                return;
+              } catch {
+                // keep scanning
+              }
+            }
+          }
+          if (!cancelled) scanTimer = window.setTimeout(tick, 0);
+        };
+        tick();
+      } catch {
         if (cancelled) return;
         setScanning(false);
         setError('Could not open the camera. Allow camera access and try again.');
-      });
+      }
+    })();
 
     return () => {
       cancelled = true;
-      controlsRef.current?.stop();
-      controlsRef.current = null;
+      if (scanTimer) window.clearTimeout(scanTimer);
       stopVideo();
     };
   }, [scanning, format, readMode, getOcrWorker]);
