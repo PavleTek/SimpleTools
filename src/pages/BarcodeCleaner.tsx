@@ -13,7 +13,6 @@ import {
 } from '@heroicons/react/24/outline';
 import {
   FORMAT_OPTIONS,
-  formatToZxing,
   parseFormatParam,
   parseReadParam,
   scanPath,
@@ -34,8 +33,6 @@ const CANVAS_SIZE = 1000;
 const GUIDE_WIDTH = 0.9;
 const GUIDE_HEIGHT = 0.18 * 1.25 * 1.25;
 const OCR_MIN_DIGITS = 6;
-const OCR_SAMPLE_TARGET = 6;
-const OCR_TICK_MS = 0;
 
 function isPhoneDevice() {
   if (typeof navigator === 'undefined') return false;
@@ -69,26 +66,6 @@ function createReader() {
   return new BrowserMultiFormatReader(hints);
 }
 
-function createLiveReader(preferredFormat?: string) {
-  const hints = new Map<DecodeHintType, BarcodeFormat[] | boolean>();
-  const preferred = preferredFormat ? formatToZxing(preferredFormat) : null;
-  hints.set(DecodeHintType.POSSIBLE_FORMATS, preferred
-    ? [preferred]
-    : [
-        BarcodeFormat.CODE_128,
-        BarcodeFormat.CODE_39,
-        BarcodeFormat.EAN_13,
-        BarcodeFormat.EAN_8,
-        BarcodeFormat.UPC_A,
-        BarcodeFormat.ITF,
-        BarcodeFormat.CODABAR,
-      ]);
-  return new BrowserMultiFormatReader(hints, {
-    delayBetweenScanAttempts: 0,
-    delayBetweenScanSuccess: 0,
-  });
-}
-
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -98,16 +75,30 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-function contrastCanvas(img: HTMLImageElement, contrast: number): HTMLCanvasElement {
+function sourceSize(source: HTMLImageElement | HTMLCanvasElement) {
+  if (source instanceof HTMLImageElement) {
+    return {
+      width: source.naturalWidth || source.width,
+      height: source.naturalHeight || source.height,
+    };
+  }
+  return { width: source.width, height: source.height };
+}
+
+function contrastCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+  contrast: number,
+): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
+  const { width, height } = sourceSize(source);
   const max = 1600;
-  const scale = Math.min(1, max / Math.max(img.width, img.height));
-  canvas.width = Math.round(img.width * scale);
-  canvas.height = Math.round(img.height * scale);
+  const scale = Math.min(1, max / Math.max(width, height));
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
   const ctx = canvas.getContext('2d');
   if (!ctx) return canvas;
   ctx.filter = `grayscale(1) contrast(${contrast})`;
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
   return canvas;
 }
 
@@ -147,6 +138,19 @@ function cropGuideFromVideo(
   if (!ctx) return null;
   ctx.filter = options?.filter ?? 'grayscale(1) contrast(1.6)';
   ctx.drawImage(video, sx, sy, sw, sh, 0, 0, outW, outH);
+  return canvas;
+}
+
+function snapshotVideo(video: HTMLVideoElement): HTMLCanvasElement | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = vw;
+  canvas.height = vh;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0);
   return canvas;
 }
 
@@ -191,6 +195,25 @@ async function decodeBarcode(url: string) {
       return reader.decodeFromCanvas(contrastCanvas(img, contrast));
     } catch {
       // try next contrast
+    }
+  }
+  throw new Error('not found');
+}
+
+async function decodeBarcodeFromCanvases(canvases: HTMLCanvasElement[]) {
+  const reader = createReader();
+  for (const canvas of canvases) {
+    try {
+      return reader.decodeFromCanvas(canvas);
+    } catch {
+      // try contrast variants
+    }
+    for (const contrast of [1.4, 2, 2.8]) {
+      try {
+        return reader.decodeFromCanvas(contrastCanvas(canvas, contrast));
+      } catch {
+        // try next
+      }
     }
   }
   throw new Error('not found');
@@ -301,9 +324,11 @@ export default function BarcodeCleaner() {
   const cameraBoxRef = useRef<HTMLDivElement>(null);
   const ocrWorkerRef = useRef<OcrWorker | null>(null);
   const autoStartedRef = useRef(false);
+  const capturingRef = useRef(false);
 
   const [isPhone, setIsPhone] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [capturing, setCapturing] = useState(false);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
   const [dateTime, setDateTime] = useState('');
   const [code, setCode] = useState('');
@@ -367,20 +392,6 @@ export default function BarcodeCleaner() {
     if (!video) return;
 
     let cancelled = false;
-    let scanTimer: number | undefined;
-
-    const finishScan = (value: string) => {
-      if (cancelled || !value) return;
-      cancelled = true;
-      setCode(value);
-      setStatus('ok');
-      setDateTime((prev) => prev || nowTicketDate());
-      setError('');
-      setScanning(false);
-      window.setTimeout(() => {
-        canvasRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }, 80);
-    };
 
     const stopVideo = () => {
       const stream = video.srcObject;
@@ -390,72 +401,14 @@ export default function BarcodeCleaner() {
       }
     };
 
-    if (readMode === 'numbers') {
-      void (async () => {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: false,
-            video: {
-              facingMode: { ideal: 'environment' },
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-            },
-          });
-          if (cancelled) {
-            stream.getTracks().forEach((track) => track.stop());
-            return;
-          }
-          video.srcObject = stream;
-          await video.play();
-          const worker = await getOcrWorker();
-          const samples: string[] = [];
-          const tick = async () => {
-            if (cancelled) return;
-            const box = cameraBoxRef.current;
-            if (box && video.readyState >= 2) {
-              const crop = cropGuideFromVideo(video, box);
-              if (crop) {
-                try {
-                  const { data } = await worker.recognize(crop);
-                  const digits = extractDigits(data.text);
-                  if (digits.length >= OCR_MIN_DIGITS) {
-                    samples.push(digits);
-                  }
-                  if (samples.length >= OCR_SAMPLE_TARGET) {
-                    finishScan(pickBestDigits(samples));
-                    return;
-                  }
-                } catch {
-                  // keep scanning
-                }
-              }
-            }
-            if (!cancelled) scanTimer = window.setTimeout(() => void tick(), OCR_TICK_MS);
-          };
-          void tick();
-        } catch {
-          if (cancelled) return;
-          setScanning(false);
-          setError('Could not open the camera. Allow camera access and try again.');
-        }
-      })();
-
-      return () => {
-        cancelled = true;
-        if (scanTimer) window.clearTimeout(scanTimer);
-        stopVideo();
-      };
-    }
-
     void (async () => {
-      const reader = createLiveReader(format);
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
             facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
           },
         });
         if (cancelled) {
@@ -464,27 +417,6 @@ export default function BarcodeCleaner() {
         }
         video.srcObject = stream;
         await video.play();
-        const tick = () => {
-          if (cancelled) return;
-          const box = cameraBoxRef.current;
-          if (box && video.readyState >= 2) {
-            const crop = cropGuideFromVideo(video, box, {
-              outWidth: 800,
-              filter: '',
-            });
-            if (crop) {
-              try {
-                const result = reader.decodeFromCanvas(crop);
-                finishScan(result.getText());
-                return;
-              } catch {
-                // keep scanning
-              }
-            }
-          }
-          if (!cancelled) scanTimer = window.setTimeout(tick, 0);
-        };
-        tick();
       } catch {
         if (cancelled) return;
         setScanning(false);
@@ -494,10 +426,29 @@ export default function BarcodeCleaner() {
 
     return () => {
       cancelled = true;
-      if (scanTimer) window.clearTimeout(scanTimer);
       stopVideo();
     };
-  }, [scanning, format, readMode, getOcrWorker]);
+  }, [scanning]);
+
+  const finishRead = useCallback((value: string, nextFormat?: string) => {
+    setCode(value);
+    if (nextFormat) setFormat(nextFormat);
+    setStatus('ok');
+    setDateTime((prev) => prev || nowTicketDate());
+    setError('');
+    window.setTimeout(() => {
+      canvasRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 80);
+  }, []);
+
+  const failRead = useCallback(() => {
+    setStatus('manual');
+    setError(
+      readMode === 'numbers'
+        ? 'Could not read the numbers. Type the number below.'
+        : 'Could not read the barcode. Type the number below.',
+    );
+  }, [readMode]);
 
   const decodeImage = useCallback(async (url: string) => {
     setStatus('reading');
@@ -515,22 +466,63 @@ export default function BarcodeCleaner() {
         }
         const digits = pickBestDigits(samples);
         if (digits.length < OCR_MIN_DIGITS) throw new Error('not found');
-        setCode(digits);
+        finishRead(digits);
       } else {
         const result = await decodeBarcode(url);
-        setCode(result.getText());
-        setFormat(mapZxingFormat(result.getBarcodeFormat()));
+        finishRead(result.getText(), mapZxingFormat(result.getBarcodeFormat()));
       }
-      setStatus('ok');
     } catch {
-      setStatus('manual');
-      setError(
-        readMode === 'numbers'
-          ? 'Could not read the numbers. Type the number below.'
-          : 'Could not read the barcode. Type the number below.',
-      );
+      failRead();
     }
-  }, [getOcrWorker, readMode]);
+  }, [failRead, finishRead, getOcrWorker, readMode]);
+
+  const analyzeStills = useCallback(async (canvases: HTMLCanvasElement[]) => {
+    setStatus('reading');
+    setError('');
+    try {
+      if (readMode === 'numbers') {
+        const worker = await getOcrWorker();
+        const samples: string[] = [];
+        for (const canvas of canvases) {
+          const { data } = await worker.recognize(canvas);
+          samples.push(extractDigits(data.text));
+          for (const contrast of [1.4, 2, 2.8]) {
+            const { data: contrasted } = await worker.recognize(contrastCanvas(canvas, contrast));
+            samples.push(extractDigits(contrasted.text));
+          }
+        }
+        const digits = pickBestDigits(samples);
+        if (digits.length < OCR_MIN_DIGITS) throw new Error('not found');
+        finishRead(digits);
+      } else {
+        const result = await decodeBarcodeFromCanvases(canvases);
+        finishRead(result.getText(), mapZxingFormat(result.getBarcodeFormat()));
+      }
+    } catch {
+      failRead();
+    }
+  }, [failRead, finishRead, getOcrWorker, readMode]);
+
+  const capturePhoto = useCallback(async () => {
+    if (capturingRef.current) return;
+    const video = videoRef.current;
+    const box = cameraBoxRef.current;
+    if (!video || video.readyState < 2) return;
+
+    capturingRef.current = true;
+    setCapturing(true);
+    const crop = box ? cropGuideFromVideo(video, box, { outWidth: 1600, filter: '' }) : null;
+    const full = snapshotVideo(video);
+    const stills = [crop, full].filter((canvas): canvas is HTMLCanvasElement => canvas !== null);
+    setScanning(false);
+    setCapturing(false);
+    capturingRef.current = false;
+    if (stills.length === 0) {
+      setError('Could not take the photo. Try again.');
+      return;
+    }
+    await analyzeStills(stills);
+  }, [analyzeStills]);
 
   const handleFile = useCallback(
     (file: File) => {
@@ -586,8 +578,8 @@ export default function BarcodeCleaner() {
           <p className={pageSubtitleClass}>
             {isPhone
               ? readMode === 'numbers'
-                ? 'Point the camera at the printed number. A clean JPG is created as soon as it is read.'
-                : 'Point the camera at the barcode. A clean JPG is created as soon as it is read.'
+                ? 'Line up the printed number and take a photo. The still picture is read after you shoot.'
+                : 'Line up the barcode and take a photo. The still picture is read after you shoot.'
               : 'Upload a photo of a ticket. Get a clean square JPG with the same barcode.'}
           </p>
         </div>
@@ -624,10 +616,10 @@ export default function BarcodeCleaner() {
                   style={{ width: `${GUIDE_WIDTH * 100}%`, height: `${GUIDE_HEIGHT * 100}%` }}
                 />
               </div>
-              <p className="pointer-events-none absolute bottom-4 inset-x-3 text-center text-xs font-medium text-white drop-shadow">
+              <p className="pointer-events-none absolute top-4 inset-x-14 text-center text-xs font-medium text-white drop-shadow">
                 {readMode === 'numbers'
-                  ? 'Line up the printed number inside the frame'
-                  : 'Line up the barcode inside the frame'}
+                  ? 'Line up the printed number, then take a photo'
+                  : 'Line up the barcode, then take a photo'}
               </p>
               <button
                 type="button"
@@ -636,6 +628,15 @@ export default function BarcodeCleaner() {
                 aria-label="Close camera"
               >
                 <XMarkIcon className="h-5 w-5" />
+              </button>
+              <button
+                type="button"
+                className="cursor-pointer absolute bottom-5 left-1/2 flex h-16 w-16 -translate-x-1/2 items-center justify-center rounded-full bg-white ring-4 ring-white/40 disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={() => void capturePhoto()}
+                disabled={capturing}
+                aria-label="Take photo"
+              >
+                <span className="h-12 w-12 rounded-full bg-white ring-2 ring-black/20" />
               </button>
             </div>
           ) : (
@@ -649,11 +650,11 @@ export default function BarcodeCleaner() {
                 }}
               >
                 <CameraIcon className="h-10 w-10" />
-                <span className="text-lg font-semibold">Tap to start camera</span>
+                <span className="text-lg font-semibold">Tap to take a photo</span>
                 <span className="text-sm text-ed-ink-fg/70">
                   {readMode === 'numbers'
-                    ? 'Line up the printed number inside the frame'
-                    : 'Line up the barcode inside the frame'}
+                    ? 'Line up the printed number, then take a photo'
+                    : 'Line up the barcode, then take a photo'}
                 </span>
               </button>
               <button
