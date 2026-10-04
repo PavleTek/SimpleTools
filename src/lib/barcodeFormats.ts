@@ -10,6 +10,25 @@ export const FORMAT_OPTIONS = [
   { label: 'Codabar', value: 'codabar' },
 ] as const;
 
+export const DEFAULT_FORMAT: BarcodeFormatValue = 'CODE128';
+
+export const OUTPUT_FORMAT_OPTIONS = [
+  { label: 'CODE128 match scan', value: 'CODE128' },
+  { label: 'CODE128-A', value: 'CODE128A' },
+  { label: 'CODE128-B long', value: 'CODE128B' },
+  { label: 'CODE128-C compact', value: 'CODE128C' },
+  { label: 'CODE39', value: 'CODE39' },
+  { label: 'EAN-13', value: 'EAN13' },
+  { label: 'EAN-8', value: 'EAN8' },
+  { label: 'UPC', value: 'UPC' },
+  { label: 'ITF', value: 'ITF' },
+  { label: 'Codabar', value: 'codabar' },
+] as const;
+
+export type OutputFormatValue = (typeof OUTPUT_FORMAT_OPTIONS)[number]['value'];
+
+export const DEFAULT_OUTPUT_FORMAT: OutputFormatValue = 'CODE128';
+
 export type BarcodeFormatValue = (typeof FORMAT_OPTIONS)[number]['value'];
 
 const ALIASES: Record<string, BarcodeFormatValue> = {
@@ -52,6 +71,27 @@ export function formatToZxing(format: string): BarcodeFormat {
   }
 }
 
+export function formatToWasm(
+  format: string,
+): 'Code39' | 'Code128' | 'EAN13' | 'EAN8' | 'UPCA' | 'ITF' | 'Codabar' {
+  switch (format) {
+    case 'CODE39':
+      return 'Code39';
+    case 'EAN13':
+      return 'EAN13';
+    case 'EAN8':
+      return 'EAN8';
+    case 'UPC':
+      return 'UPCA';
+    case 'ITF':
+      return 'ITF';
+    case 'codabar':
+      return 'Codabar';
+    default:
+      return 'Code128';
+  }
+}
+
 export const READ_MODES = [
   { label: 'Barcode', value: 'barcode' },
   { label: 'Numbers', value: 'numbers' },
@@ -67,13 +107,13 @@ export function parseReadParam(raw: string | undefined): ReadMode | null {
   return null;
 }
 
-export function scanPath(format: string = 'CODE128', read: ReadMode = 'barcode'): string {
+export function scanPath(format: string = DEFAULT_FORMAT, read: ReadMode = 'barcode'): string {
   if (read === 'numbers') return `/scan/${format}/numbers`;
   return `/scan/${format}`;
 }
 
 export function scanUrl(
-  format: string = 'CODE128',
+  format: string = DEFAULT_FORMAT,
   origin = window.location.origin,
   read: ReadMode = 'barcode',
 ): string {

@@ -6,7 +6,7 @@ const TOOLS = [
   {
     to: '/scan',
     title: 'Barcode cleaner',
-    description: 'Scan a ticket barcode on your phone and get a clean square JPG —  ready to send.',
+    description: 'Scan a ticket barcode on your phone and get a clean square JPG with a configurable barcode size — ready to send.',
     icon: QrCodeIcon,
   },
   {
